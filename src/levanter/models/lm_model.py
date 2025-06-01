@@ -19,29 +19,6 @@ LmConfigT = TypeVar("LmConfigT", bound="LmConfig")
 LmT = TypeVar("LmT", bound="LmHeadModel")
 
 
-def l2_weight_decay(model_params: eqx.Module, weight: float = 0.0) -> jnp.ndarray:
-    """
-    Computes L2 weight decay regularization.
-    
-    Args:
-        model_params: The model parameters to compute weight decay for
-        weight: Weight for the L2 regularization term
-        
-    Returns:
-        The L2 regularization loss
-    """
-    if weight == 0.0:
-        return jnp.array(0.0)
-
-    params_leaves = jax.tree_util.tree_leaves(model_params)
-    l2_reg = jnp.sum(jnp.array([
-        jnp.sum(p ** 2) for p in params_leaves 
-        if hasattr(p, 'ndim') and p.ndim > 1 and jnp.issubdtype(p.dtype, jnp.number)
-    ]))
-
-    return weight * l2_reg
-
-
 class LmExample(eqx.Module):
     tokens: hax.NamedArray
     loss_mask: hax.NamedArray
@@ -269,12 +246,9 @@ def compute_next_token_loss(
     l2_weight_decay_weight: Optional[float] = None,
 ) -> jnp.ndarray | NamedArray:
     """
-    Computes the cross-entropy loss for a language modeling example. If reduction is not None, the loss is reduced
-    across the reduction axis (with reduction_axis=None meaning all axes). If reduction is None, the loss is not
-    reduced, and the result is a named array with axes (*batch axes, sequence_length).
-    
-    Note: This function now includes L2 weight decay and returns just the total loss for compatibility.
+    Computes the cross-entropy loss for a language modeling example.
     """
+    
     # Get activations from the model
     activations = model.activations(example.tokens, example.attn_mask, key=key)
 
@@ -282,8 +256,7 @@ def compute_next_token_loss(
     if isinstance(activations, tuple):
         activations, aux_loss = activations
 
-    # Compute the main cross-entropy loss
-    ce_loss = maybe_fused_next_token_loss(
+    loss = maybe_fused_next_token_loss(
         model.Pos,
         model.Embed,
         model.Vocab,
@@ -299,13 +272,10 @@ def compute_next_token_loss(
     )
 
     # Compute L2 regularization term if needed
-    l2_reg = jnp.array(0.0)
     if l2_weight_decay_weight is not None and l2_weight_decay_weight != 0.0:
+        from levanter.models.loss import l2_weight_decay
         l2_reg = l2_weight_decay(model, l2_weight_decay_weight)
+        loss = loss + l2_reg
 
-    # Calculate total loss
-    total_loss = ce_loss + aux_loss + l2_reg
+    return loss + aux_loss
 
-    # For now, just return the total loss for compatibility
-    # Individual metrics logging can be added later via hooks
-    return total_loss

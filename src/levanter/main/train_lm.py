@@ -27,6 +27,7 @@ from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel, compute_n
 from levanter.optim import AdamConfig, OptimizerConfig
 from levanter.trainer import Trainer, TrainerConfig
 from levanter.utils.jax_utils import parameter_count
+from levanter.callbacks import StepInfo
 
 
 logger = logging.getLogger(__name__)
@@ -103,17 +104,13 @@ def main(config: TrainLmConfig):
 
     # Create loss function with L2 weight decay and z-loss
     def loss_function(model, example, *, key=None):
-        # Call the updated compute_next_token_loss function
-        total_loss = compute_next_token_loss(
+        return compute_next_token_loss(
             model, 
             example, 
             key=key,
             logsumexp_weight=config.z_loss_weight,
             l2_weight_decay_weight=config.l2_weight_decay
         )
-        
-        # Return just the total loss (now includes L2 and Z-loss)
-        return total_loss
 
     # Using the trainer as a context manager does 3 things:
     # 1. Sets the device mesh
@@ -203,6 +200,69 @@ def main(config: TrainLmConfig):
                 mp=config.trainer.mp,
             )
             trainer.add_hook(cb, every=config.trainer.steps_per_eval)
+
+        # Add evaluation hook for loss components if using z-loss or L2
+        if config.z_loss_weight != 0.0 or config.l2_weight_decay != 0.0:
+            from levanter.models.loss import maybe_fused_next_token_loss_with_components, l2_weight_decay
+            
+            # Create a separate evaluation function for loss components
+            @named_jit(
+                in_axis_resources=parameter_axis_mapping,
+                axis_resources=compute_axis_mapping,
+                out_axis_resources={},
+            )
+            def compute_loss_components(model, example):
+                model = trainer.mp.cast_to_compute(model)
+                
+                # Get activations
+                activations = model.activations(example.tokens, example.attn_mask)
+                aux_loss = jnp.array(0.0)
+                if isinstance(activations, tuple):
+                    activations, aux_loss = activations
+                
+                # Compute loss components
+                _, components = maybe_fused_next_token_loss_with_components(
+                    model.Pos,
+                    model.Embed,
+                    model.Vocab,
+                    activations,
+                    model.get_lm_head(),
+                    example.tokens,
+                    loss_mask=example.loss_mask,
+                    logsumexp_weight=config.z_loss_weight,
+                    block_size=model.config.cross_entropy_block_size,
+                )
+                
+                # Compute L2
+                l2_loss = jnp.array(0.0)
+                if config.l2_weight_decay != 0.0:
+                    l2_loss = l2_weight_decay(model, config.l2_weight_decay)
+                
+                return {
+                    "ce_loss": components["ce_loss"],
+                    "z_loss": components["z_loss"],
+                    "aux_loss": aux_loss,
+                    "l2_loss": l2_loss,
+                }
+            
+            # Add hook to compute and log components periodically
+            @trainer.add_hook(every=100)  # Log every 100 steps
+            def log_loss_components(step_info: StepInfo):
+                # Get a batch from the training data
+                try:
+                    batch_iter = iter(trainer.data_loader(train_dataset))
+                    example = next(batch_iter)
+                    
+                    # Compute components
+                    components = compute_loss_components(step_info.state.model, example)
+                    
+                    # Log them
+                    metrics = {
+                        f"train/{k}": float(v) for k, v in components.items()
+                    }
+                    levanter.tracker.log(metrics, step=step_info.step)
+                except Exception as e:
+                    logger.warning(f"Failed to log loss components: {e}")
 
         flops_per_token = config.model.flops_per_token(vocab_size)
         flops_per_example = 3 * flops_per_token * Pos.size if flops_per_token is not None else None
