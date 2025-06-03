@@ -1,5 +1,5 @@
 import functools
-from typing import Optional
+from typing import Optional, Tuple, Dict
 
 import equinox
 import jax
@@ -8,6 +8,82 @@ import jax.numpy as jnp
 import haliax as hax
 from haliax import NamedArray
 from haliax.nn import cross_entropy_loss_and_log_normalizers
+
+
+def l2_weight_decay(model_params: equinox.Module, weight: float = 0.0) -> jnp.ndarray:
+    """
+    Computes L2 weight decay regularization.
+    
+    Args:
+        model_params: The model parameters to compute weight decay for
+        weight: Weight for the L2 regularization term
+        
+    Returns:
+        The L2 regularization loss
+    """
+    if weight == 0.0:
+        return jnp.array(0.0)
+
+    params_leaves = jax.tree_util.tree_leaves(model_params)
+    l2_reg = jnp.sum(jnp.array([
+        jnp.sum(p ** 2) for p in params_leaves 
+        if hasattr(p, 'ndim') and p.ndim > 1 and jnp.issubdtype(p.dtype, jnp.number)
+    ]))
+
+    return weight * l2_reg
+
+
+def maybe_fused_next_token_loss_with_components(
+    Pos: hax.AxisSelector,
+    Embed: hax.AxisSelector,
+    Vocab: hax.AxisSelector,
+    pred_embeddings: NamedArray,
+    pred_lm_head: NamedArray,
+    true_ids: NamedArray,
+    loss_mask: Optional[NamedArray] = None,
+    reduction: Optional[hax.ReductionFunction] = hax.mean,
+    reduction_axis: Optional[hax.AxisSelection] = None,
+    logsumexp_weight: Optional[float] = None,
+    block_size: Optional[int] = None,
+    dtype: Optional[jnp.dtype] = jnp.float32,
+) -> Tuple[NamedArray, Dict[str, NamedArray]]:
+    """
+    Compute the next token loss with optional block-wise processing and return individual components.
+    
+    Returns:
+        Tuple of (total_loss, components_dict) where components_dict contains:
+        - ce_loss: cross-entropy loss
+        - z_loss: z-loss (logsumexp penalty)
+    """
+    # Compute CE loss without Z-loss first
+    ce_loss = maybe_fused_next_token_loss(
+        Pos, Embed, Vocab, pred_embeddings, pred_lm_head, true_ids,
+        loss_mask, reduction, reduction_axis, 
+        logsumexp_weight=None,  # No Z-loss for CE computation
+        block_size=block_size, dtype=dtype
+    )
+    
+    # Compute Z-loss
+    z_loss = jnp.array(0.0)
+    if logsumexp_weight is not None and logsumexp_weight != 0.0:
+        # Compute total loss with Z-loss
+        total_with_z = maybe_fused_next_token_loss(
+            Pos, Embed, Vocab, pred_embeddings, pred_lm_head, true_ids,
+            loss_mask, reduction, reduction_axis, 
+            logsumexp_weight=logsumexp_weight,
+            block_size=block_size, dtype=dtype
+        )
+        # Z-loss is the difference
+        z_loss = total_with_z - ce_loss
+    
+    total_loss = ce_loss + z_loss
+    
+    components = {
+        "ce_loss": ce_loss,
+        "z_loss": z_loss,
+    }
+    
+    return total_loss, components
 
 
 def maybe_fused_next_token_loss(

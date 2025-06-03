@@ -4,6 +4,7 @@ from typing import Generic, Optional, Type, TypeVar
 
 import draccus
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 from jaxtyping import PRNGKeyArray
 
@@ -242,15 +243,16 @@ def compute_next_token_loss(
     reduction_axis: Optional[hax.AxisSelection] = None,
     logsumexp_weight: Optional[float] = None,
     loss_dtype: Optional[jnp.dtype] = jnp.float32,
+    l2_weight_decay_weight: Optional[float] = None,
 ) -> jnp.ndarray | NamedArray:
     """
-    Computes the cross-entropy loss for a language modeling example. If reduction is not None, the loss is reduced
-    across the reduction axis (with reduction_axis=None meaning all axes). If reduction is None, the loss is not
-    reduced, and the result is a named array with axes (*batch axes, sequence_length).
+    Computes the cross-entropy loss for a language modeling example.
     """
+    
+    # Get activations from the model
     activations = model.activations(example.tokens, example.attn_mask, key=key)
 
-    aux_loss = 0
+    aux_loss = jnp.array(0.0)
     if isinstance(activations, tuple):
         activations, aux_loss = activations
 
@@ -269,4 +271,11 @@ def compute_next_token_loss(
         block_size=model.config.cross_entropy_block_size,
     )
 
+    # Compute L2 regularization term if needed
+    if l2_weight_decay_weight is not None and l2_weight_decay_weight != 0.0:
+        from levanter.models.loss import l2_weight_decay
+        l2_reg = l2_weight_decay(model, l2_weight_decay_weight)
+        loss = loss + l2_reg
+
     return loss + aux_loss
+
